@@ -302,6 +302,11 @@ if (
         }
 
         input:focus { outline: none; border-color: var(--accent); }
+        input[readonly] {
+            background: #eee;
+            color: var(--muted);
+            cursor: not-allowed;
+        }
 
         button {
             padding: 8px 16px;
@@ -341,8 +346,14 @@ if (
 
         tr:hover td { background: var(--bg-soft); }
 
-        .row-delete form { display: inline; }
-        .row-delete button {
+        .row-actions { white-space: nowrap; }
+        .row-actions form { display: inline; }
+        .row-actions .row-edit {
+            background: transparent;
+            color: var(--text);
+            border-color: var(--border);
+        }
+        .row-actions .row-delete {
             background: none;
             border: none;
             color: var(--danger);
@@ -411,12 +422,17 @@ if (
                             <?php $key = $column['column_name']; ?>
                             <td><?= htmlspecialchars((string) ($row[$key] ?? ''), ENT_QUOTES, 'UTF-8') ?></td>
                         <?php endforeach; ?>
-                        <td class="row-delete">
+                        <td class="row-actions">
+                            <button
+                                type="button"
+                                class="row-edit"
+                                data-row="<?= htmlspecialchars(json_encode($row, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT), ENT_QUOTES, 'UTF-8') ?>"
+                            >Edit</button>
                             <form method="post">
                                 <input type="hidden" name="action" value="delete">
                                 <input type="hidden" name="table" value="<?= htmlspecialchars($currentTable, ENT_QUOTES, 'UTF-8') ?>">
                                 <input type="hidden" name="<?= htmlspecialchars($selectedPrimaryKey, ENT_QUOTES, 'UTF-8') ?>" value="<?= (int) ($row[$selectedPrimaryKey] ?? 0) ?>">
-                                <button type="submit">Delete</button>
+                                <button type="submit" class="row-delete">Delete</button>
                             </form>
                         </td>
                     </tr>
@@ -428,14 +444,14 @@ if (
 
     <section>
         <h2>Update <?= htmlspecialchars(formatLabel($currentTable, 'Table'), ENT_QUOTES, 'UTF-8') ?></h2>
-        <form method="post">
+        <form method="post" id="update-form">
             <input type="hidden" name="action" value="update">
             <input type="hidden" name="table" value="<?= htmlspecialchars($currentTable, ENT_QUOTES, 'UTF-8') ?>">
 
             <?php if ($selectedPrimaryKey): ?>
                 <div class="field">
                     <label for="update_pk"><?= htmlspecialchars(formatLabel($selectedPrimaryKey, 'Id'), ENT_QUOTES, 'UTF-8') ?></label>
-                    <input id="update_pk" type="number" name="<?= htmlspecialchars($selectedPrimaryKey, ENT_QUOTES, 'UTF-8') ?>" required>
+                    <input id="update_pk" type="number" name="<?= htmlspecialchars($selectedPrimaryKey, ENT_QUOTES, 'UTF-8') ?>" readonly required>
                 </div>
             <?php endif; ?>
 
@@ -443,12 +459,29 @@ if (
                 <?php $columnName = $column['column_name']; ?>
                 <div class="field">
                     <label for="update_<?= htmlspecialchars($columnName, ENT_QUOTES, 'UTF-8') ?>"><?= htmlspecialchars(formatLabel($columnName, 'Field'), ENT_QUOTES, 'UTF-8') ?></label>
-                    <input id="update_<?= htmlspecialchars($columnName, ENT_QUOTES, 'UTF-8') ?>" type="text" name="<?= htmlspecialchars($columnName, ENT_QUOTES, 'UTF-8') ?>" required>
+                    <input id="update_<?= htmlspecialchars($columnName, ENT_QUOTES, 'UTF-8') ?>" type="text" name="<?= htmlspecialchars($columnName, ENT_QUOTES, 'UTF-8') ?>" data-update-field required>
                 </div>
             <?php endforeach; ?>
 
             <button type="submit" class="secondary">Update Record</button>
         </form>
     </section>
+    <script>
+        const updateForm = document.getElementById('update-form');
+
+        document.querySelectorAll('.row-edit').forEach((button) => {
+            button.addEventListener('click', () => {
+                const record = JSON.parse(button.dataset.row);
+
+                Object.entries(record).forEach(([name, value]) => {
+                    const field = updateForm.elements.namedItem(name);
+                    if (field) field.value = value ?? '';
+                });
+
+                updateForm.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                updateForm.querySelector('[data-update-field]')?.focus();
+            });
+        });
+    </script>
 </body>
 </html>
