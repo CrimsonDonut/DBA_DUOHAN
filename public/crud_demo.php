@@ -5,7 +5,9 @@ require __DIR__ . '/../config/db.php';
 try {
     $pdo = getPdo();
 } catch (PDOException $e) {
-    die('Database connection failed.');
+    error_log('Database connection failed: ' . $e->getMessage());
+    http_response_code(500);
+    die('The database is unavailable. Please contact the site administrator.');
 }
 
 function getExistingTables(PDO $pdo): array
