@@ -7,7 +7,11 @@ try {
 } catch (PDOException $e) {
     error_log('Database connection failed: ' . $e->getMessage());
     http_response_code(500);
-    die('The database is unavailable. Please contact the site administrator.');
+    die('Database connection failed: ' . htmlspecialchars(
+        $e->getMessage(),
+        ENT_QUOTES | ENT_SUBSTITUTE,
+        'UTF-8'
+    ));
 }
 
 function getExistingTables(PDO $pdo): array
