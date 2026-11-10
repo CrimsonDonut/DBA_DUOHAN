@@ -7,7 +7,7 @@ function getPdo(): PDO
         'port' => getenv('DB_PORT') ?: '5432',
         'dbname' => getenv('DB_NAME') ?: 'Duo_Ton',
         'user' => getenv('DB_USER') ?: 'postgres',
-        'password' => getenv('DB_PASSWORD') ?: 'ton0127',
+        'password' => getenv('DB_PASSWORD') ?: 'PostGreSQL123',
     ];
 
     $dsn = sprintf(
