@@ -1,438 +1,444 @@
 <?php
 
-require __DIR__ . '/../config/db.php';
+require __DIR__ . '/_common.php';
 
-try {
-    $pdo = getPdo();
-} catch (PDOException $e) {
-    error_log('Database connection failed: ' . $e->getMessage());
-    http_response_code(500);
-    die('Database connection failed: ' . htmlspecialchars(
-        $e->getMessage(),
-        ENT_QUOTES | ENT_SUBSTITUTE,
-        'UTF-8'
-    ));
-}
+$pdo = connect();
 
-function getExistingTables(PDO $pdo): array
+/* ------------------------------------------------------------------ *
+ * Table list (taken from the database, audit table kept read-only)
+ * ------------------------------------------------------------------ */
+$tableLabels = [
+    'borrowers'           => 'Borrowers',
+    'equipment'           => 'Equipment',
+    'borrow_transactions' => 'Transactions',
+    'borrow_items'        => 'Borrow Items',
+];
+$hiddenTables = ['borrow_items_audit']; // written by triggers only; see Reports
+
+function getExistingTables(PDO $pdo, array $hidden, array $preferredOrder): array
 {
     $stmt = $pdo->query(
         "SELECT table_name
          FROM information_schema.tables
-         WHERE table_schema = 'public'
-           AND table_type = 'BASE TABLE'
+         WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
          ORDER BY table_name"
     );
+    $tables = array_values(array_diff($stmt->fetchAll(PDO::FETCH_COLUMN, 0), $hidden));
 
-    $tables = $stmt->fetchAll(PDO::FETCH_COLUMN, 0);
-    return array_values(array_filter(array_map('strval', $tables), function ($tableName) {
-        return $tableName !== '';
-    }));
+    usort($tables, function ($a, $b) use ($preferredOrder) {
+        $pa = array_search($a, $preferredOrder, true);
+        $pb = array_search($b, $preferredOrder, true);
+        $pa = $pa === false ? 99 : $pa;
+        $pb = $pb === false ? 99 : $pb;
+        return $pa === $pb ? strcmp($a, $b) : $pa <=> $pb;
+    });
+
+    return $tables;
 }
 
-$allowedTables = getExistingTables($pdo);
+$allowedTables = getExistingTables($pdo, $hiddenTables, array_keys($tableLabels));
 if (empty($allowedTables)) {
-    $allowedTables = ['borrowers', 'equipment', 'transactions'];
+    die('No tables found in the public schema.');
 }
 
-$currentTable = $_GET['table'] ?? ($allowedTables[0] ?? 'borrowers');
+$currentTable = $_GET['table'] ?? $allowedTables[0];
 if (!in_array($currentTable, $allowedTables, true)) {
-    $currentTable = $allowedTables[0] ?? 'borrowers';
+    $currentTable = $allowedTables[0];
 }
 
-function getTableMetadata(PDO $pdo, string $tableName): array
+/* ------------------------------------------------------------------ *
+ * Metadata helpers
+ * ------------------------------------------------------------------ */
+function quoteIdent(string $name): string
 {
-    $safeTableName = preg_replace('/[^a-zA-Z0-9_]/', '', $tableName);
-    if ($safeTableName === '') {
-        return ['primaryKey' => null, 'columns' => []];
-    }
+    return '"' . str_replace('"', '""', $name) . '"';
+}
 
+function getTableMetadata(PDO $pdo, string $table): array
+{
     $columnStmt = $pdo->prepare(
-        "SELECT column_name, data_type, is_nullable
+        "SELECT column_name, data_type, is_nullable, column_default
          FROM information_schema.columns
-         WHERE table_schema = 'public' AND table_name = :table_name
+         WHERE table_schema = 'public' AND table_name = :t
          ORDER BY ordinal_position"
     );
-    $columnStmt->execute([':table_name' => $safeTableName]);
+    $columnStmt->execute([':t' => $table]);
     $columns = $columnStmt->fetchAll(PDO::FETCH_ASSOC);
 
     $pkStmt = $pdo->prepare(
-        "SELECT c.column_name
+        "SELECT kcu.column_name
          FROM information_schema.table_constraints tc
          JOIN information_schema.key_column_usage kcu
            ON tc.constraint_name = kcu.constraint_name
           AND tc.table_schema = kcu.table_schema
-         JOIN information_schema.columns c
-           ON c.table_schema = kcu.table_schema
-          AND c.table_name = kcu.table_name
-          AND c.ordinal_position = kcu.ordinal_position
+          AND tc.table_name = kcu.table_name
          WHERE tc.constraint_type = 'PRIMARY KEY'
            AND tc.table_schema = 'public'
-           AND tc.table_name = :table_name
-         ORDER BY c.ordinal_position
+           AND tc.table_name = :t
+         ORDER BY kcu.ordinal_position
          LIMIT 1"
     );
-    $pkStmt->execute([':table_name' => $safeTableName]);
-    $primaryKey = $pkStmt->fetchColumn();
+    $pkStmt->execute([':t' => $table]);
 
-    return ['primaryKey' => $primaryKey ?: null, 'columns' => $columns];
+    return ['primaryKey' => $pkStmt->fetchColumn() ?: null, 'columns' => $columns];
 }
 
-function sanitizeValue(string $key, array $values)
+/** Single-column foreign keys of a table: column => [ref_table, ref_column]. */
+function getForeignKeys(PDO $pdo, string $table): array
 {
-    $value = $values[$key] ?? '';
-    return is_scalar($value) ? trim((string) $value) : '';
+    $stmt = $pdo->prepare(
+        "SELECT a.attname AS column_name, rc.relname AS ref_table, ra.attname AS ref_column
+         FROM pg_constraint c
+         JOIN pg_class cl ON cl.oid = c.conrelid
+         JOIN pg_namespace n ON n.oid = cl.relnamespace
+         JOIN pg_class rc ON rc.oid = c.confrelid
+         JOIN pg_attribute a  ON a.attrelid  = c.conrelid  AND a.attnum  = c.conkey[1]
+         JOIN pg_attribute ra ON ra.attrelid = c.confrelid AND ra.attnum = c.confkey[1]
+         WHERE c.contype = 'f' AND n.nspname = 'public'
+           AND cl.relname = :t AND array_length(c.conkey, 1) = 1"
+    );
+    $stmt->execute([':t' => $table]);
+
+    $map = [];
+    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $map[$row['column_name']] = [$row['ref_table'], $row['ref_column']];
+    }
+    return $map;
 }
 
-function formatLabel(?string $value, string $fallback = 'Record'): string
+/** Dropdown choices for a foreign-key column. */
+function getForeignKeyOptions(PDO $pdo, string $refTable, string $refColumn): array
 {
-    $clean = trim((string) ($value ?? ''));
-    $clean = str_replace('_', ' ', $clean);
-    $clean = trim($clean);
+    $labels = [
+        'borrowers'           => "borrower_no || ' - ' || full_name",
+        'equipment'           => "property_no || ' - ' || equipment_name || ' (' || quantity_available || ' available)'",
+        'borrow_transactions' => "'Transaction #' || borrow_id || ' (' || status || ', due ' || due_date || ')'",
+    ];
 
-    if ($clean === '') {
-        $clean = $fallback;
+    $valueSql = quoteIdent($refColumn);
+    $labelSql = $labels[$refTable] ?? ($valueSql . '::text');
+
+    return $pdo->query(
+        'SELECT ' . $valueSql . ' AS value, ' . $labelSql . ' AS label
+         FROM ' . quoteIdent($refTable) . ' ORDER BY ' . $valueSql
+    )->fetchAll(PDO::FETCH_ASSOC);
+}
+
+$fixedOptions = [
+    'status'        => ['Active', 'Returned', 'Overdue', 'Cancelled'],
+    'borrower_type' => ['Student', 'Faculty', 'Staff', 'Researcher'],
+];
+
+/* ------------------------------------------------------------------ *
+ * Validation
+ * ------------------------------------------------------------------ */
+function labelFor(string $column): string
+{
+    return ucfirst(str_replace('_', ' ', $column));
+}
+
+/** Returns an error message, or null when the value has an acceptable format. */
+function validateFormat(array $column, string $raw): ?string
+{
+    $label = labelFor($column['column_name']);
+
+    if (in_array($column['data_type'], ['integer', 'smallint', 'bigint'], true)) {
+        return preg_match('/^-?\d+$/', $raw) ? null : $label . ' must be a whole number.';
+    }
+    if ($column['data_type'] === 'date') {
+        return isValidDate($raw) ? null : $label . ' must be a valid date (YYYY-MM-DD).';
+    }
+    if (mb_strlen($raw) > 255) {
+        return $label . ' is too long.';
+    }
+    return null;
+}
+
+/**
+ * Prepare one POST value for each editable column.
+ * Returns [values, errors]; omitted columns (use DB default) are left out of $values.
+ */
+function collectValues(array $editableColumns, array $post, bool $isCreate): array
+{
+    $values = [];
+    $errors = [];
+
+    foreach ($editableColumns as $column) {
+        $name = $column['column_name'];
+        $raw = isset($post[$name]) && is_scalar($post[$name]) ? trim((string) $post[$name]) : '';
+        $nullable = $column['is_nullable'] === 'YES';
+        $hasDefault = $column['column_default'] !== null;
+
+        if ($raw === '') {
+            if ($isCreate && $hasDefault) {
+                continue;                       // let PostgreSQL apply the default
+            }
+            if ($nullable) {
+                $values[$name] = null;
+                continue;
+            }
+            $errors[] = labelFor($name) . ' is required.';
+            continue;
+        }
+
+        $formatError = validateFormat($column, $raw);
+        if ($formatError !== null) {
+            $errors[] = $formatError;
+            continue;
+        }
+        $values[$name] = $raw;
     }
 
-    return ucfirst($clean);
+    return [$values, $errors];
 }
 
-foreach ($allowedTables as $tableName) {
-    $tableMeta[$tableName] = getTableMetadata($pdo, $tableName);
-    $primaryKey = $tableMeta[$tableName]['primaryKey'];
-
-    if ($primaryKey) {
-        $tableMeta[$tableName]['readRows'] = $pdo->query(
-            'SELECT * FROM ' . $tableName . ' ORDER BY ' . $primaryKey . ' DESC'
-        )->fetchAll(PDO::FETCH_ASSOC);
-    } else {
-        $tableMeta[$tableName]['readRows'] = [];
-    }
+function redirectToTable(string $table): void
+{
+    header('Location: ' . $_SERVER['PHP_SELF'] . '?table=' . urlencode($table));
+    exit;
 }
 
-if (
-    $_SERVER['REQUEST_METHOD'] === 'POST' &&
-    ($_POST['action'] ?? '') === 'create'
-) {
+/* ------------------------------------------------------------------ *
+ * POST actions: create / update / delete (all parameterized)
+ * ------------------------------------------------------------------ */
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
     $tableName = $_POST['table'] ?? $currentTable;
+
     if (!in_array($tableName, $allowedTables, true)) {
-        die('Invalid table.');
+        flash('error', 'Invalid table.');
+        redirectToTable($currentTable);
     }
 
     $meta = getTableMetadata($pdo, $tableName);
     $primaryKey = $meta['primaryKey'];
-    $editableColumns = array_values(array_filter(
+    $tableTitle = $tableLabels[$tableName] ?? labelFor($tableName);
+
+    if (!$primaryKey || !in_array($action, ['create', 'update', 'delete'], true)) {
+        flash('error', 'Unsupported action for this table.');
+        redirectToTable($tableName);
+    }
+
+    $editable = array_values(array_filter(
         $meta['columns'],
         function ($column) use ($primaryKey) {
-            return $primaryKey === null || ($column['column_name'] ?? '') !== $primaryKey;
+            return $column['column_name'] !== $primaryKey;
         }
     ));
 
-    if (empty($editableColumns)) {
-        $pdo->exec('INSERT INTO ' . $tableName . ' DEFAULT VALUES');
-        header('Location: ' . $_SERVER['PHP_SELF'] . '?table=' . urlencode($tableName));
-        exit;
-    }
+    try {
+        if ($action === 'create') {
+            [$values, $errors] = collectValues($editable, $_POST, true);
+            if ($errors) {
+                foreach ($errors as $error) {
+                    flash('error', $error);
+                }
+                redirectToTable($tableName);
+            }
 
-    $columnNames = array_map(function ($column) {
-        return $column['column_name'];
-    }, $editableColumns);
+            if (empty($values)) {
+                $pdo->exec('INSERT INTO ' . quoteIdent($tableName) . ' DEFAULT VALUES');
+            } else {
+                $columnSql = implode(', ', array_map('quoteIdent', array_keys($values)));
+                $marks = implode(', ', array_fill(0, count($values), '?'));
+                $stmt = $pdo->prepare(
+                    'INSERT INTO ' . quoteIdent($tableName) . ' (' . $columnSql . ') VALUES (' . $marks . ')'
+                );
+                $stmt->execute(array_values($values));
+            }
+            flash('success', $tableTitle . ': record added.');
 
-    $placeholders = array_map(function ($column) {
-        return ':' . $column['column_name'];
-    }, $editableColumns);
+        } elseif ($action === 'update') {
+            $id = filter_var($_POST[$primaryKey] ?? '', FILTER_VALIDATE_INT);
+            if ($id === false) {
+                flash('error', 'Choose a record to update with its Edit button first.');
+                redirectToTable($tableName);
+            }
 
-    $stmt = $pdo->prepare(
-        'INSERT INTO ' . $tableName . ' (' . implode(', ', $columnNames) . ') VALUES (' . implode(', ', $placeholders) . ')'
-    );
+            [$values, $errors] = collectValues($editable, $_POST, false);
+            if ($errors) {
+                foreach ($errors as $error) {
+                    flash('error', $error);
+                }
+                redirectToTable($tableName);
+            }
 
-    $params = [];
-    foreach ($editableColumns as $column) {
-        $columnName = $column['column_name'];
-        $params[':' . $columnName] = sanitizeValue($columnName, $_POST);
-    }
+            $assignments = implode(', ', array_map(function ($name) {
+                return quoteIdent($name) . ' = ?';
+            }, array_keys($values)));
+            $stmt = $pdo->prepare(
+                'UPDATE ' . quoteIdent($tableName) . ' SET ' . $assignments
+                . ' WHERE ' . quoteIdent($primaryKey) . ' = ?'
+            );
+            $stmt->execute(array_merge(array_values($values), [$id]));
 
-    $stmt->execute($params);
-    header('Location: ' . $_SERVER['PHP_SELF'] . '?table=' . urlencode($tableName));
-    exit;
-}
+            if ($stmt->rowCount() === 0) {
+                flash('error', 'No record found with ID ' . $id . '.');
+            } else {
+                flash('success', $tableTitle . ': record ' . $id . ' updated.');
+            }
 
-if (
-    $_SERVER['REQUEST_METHOD'] === 'POST' &&
-    ($_POST['action'] ?? '') === 'update'
-) {
-    $tableName = $_POST['table'] ?? $currentTable;
-    if (!in_array($tableName, $allowedTables, true)) {
-        die('Invalid table.');
-    }
+        } else { // delete
+            $id = filter_var($_POST[$primaryKey] ?? '', FILTER_VALIDATE_INT);
+            if ($id === false) {
+                flash('error', 'Invalid record ID.');
+                redirectToTable($tableName);
+            }
 
-    $meta = getTableMetadata($pdo, $tableName);
-    $primaryKey = $meta['primaryKey'];
-    if (!$primaryKey) {
-        die('Table has no primary key.');
-    }
+            $stmt = $pdo->prepare(
+                'DELETE FROM ' . quoteIdent($tableName) . ' WHERE ' . quoteIdent($primaryKey) . ' = ?'
+            );
+            $stmt->execute([$id]);
 
-    $editableColumns = array_values(array_filter(
-        $meta['columns'],
-        function ($column) use ($primaryKey) {
-            return ($column['column_name'] ?? '') !== $primaryKey;
+            if ($stmt->rowCount() === 0) {
+                flash('error', 'No record found with ID ' . $id . '.');
+            } else {
+                flash('success', $tableTitle . ': record ' . $id . ' deleted.');
+            }
         }
-    ));
-
-    $assignments = array_map(function ($column) {
-        return $column['column_name'] . ' = :' . $column['column_name'];
-    }, $editableColumns);
-
-    $stmt = $pdo->prepare(
-        'UPDATE ' . $tableName . ' SET ' . implode(', ', $assignments) . ' WHERE ' . $primaryKey . ' = :' . $primaryKey
-    );
-
-    $params = [];
-    foreach ($editableColumns as $column) {
-        $columnName = $column['column_name'];
-        $params[':' . $columnName] = sanitizeValue($columnName, $_POST);
+    } catch (PDOException $e) {
+        error_log('CRUD error: ' . $e->getMessage());
+        flash('error', dbErrorMessage($e));
     }
-    $params[':' . $primaryKey] = (int) ($_POST[$primaryKey] ?? 0);
 
-    $stmt->execute($params);
-    header('Location: ' . $_SERVER['PHP_SELF'] . '?table=' . urlencode($tableName));
-    exit;
+    redirectToTable($tableName);
 }
 
-if (
-    $_SERVER['REQUEST_METHOD'] === 'POST' &&
-    ($_POST['action'] ?? '') === 'delete'
-) {
-    $tableName = $_POST['table'] ?? $currentTable;
-    if (!in_array($tableName, $allowedTables, true)) {
-        die('Invalid table.');
+/* ------------------------------------------------------------------ *
+ * Read data for the page
+ * ------------------------------------------------------------------ */
+$meta = getTableMetadata($pdo, $currentTable);
+$primaryKey = $meta['primaryKey'];
+$columns = $meta['columns'];
+$editableColumns = array_values(array_filter(
+    $columns,
+    function ($column) use ($primaryKey) {
+        return $column['column_name'] !== $primaryKey;
     }
+));
 
-    $meta = getTableMetadata($pdo, $tableName);
-    $primaryKey = $meta['primaryKey'];
-    if (!$primaryKey) {
-        die('Table has no primary key.');
-    }
-
-    $stmt = $pdo->prepare('DELETE FROM ' . $tableName . ' WHERE ' . $primaryKey . ' = :' . $primaryKey);
-    $stmt->execute([':' . $primaryKey => (int) ($_POST[$primaryKey] ?? 0)]);
-    header('Location: ' . $_SERVER['PHP_SELF'] . '?table=' . urlencode($tableName));
-    exit;
+$rows = [];
+if ($primaryKey) {
+    $rows = $pdo->query(
+        'SELECT * FROM ' . quoteIdent($currentTable) . ' ORDER BY ' . quoteIdent($primaryKey) . ' DESC'
+    )->fetchAll(PDO::FETCH_ASSOC);
 }
+
+$foreignKeys = getForeignKeys($pdo, $currentTable);
+$foreignOptions = [];
+foreach ($foreignKeys as $columnName => [$refTable, $refColumn]) {
+    $foreignOptions[$columnName] = getForeignKeyOptions($pdo, $refTable, $refColumn);
+}
+
+$foreignLabels = [];
+foreach ($foreignOptions as $columnName => $options) {
+    foreach ($options as $option) {
+        $foreignLabels[$columnName][(string) $option['value']] = $option['label'];
+    }
+}
+
+/** Form control for one column: dropdown for foreign keys / fixed lists, else typed input. */
+function renderControl(array $column, array $foreignOptions, array $fixedOptions, string $prefix, bool $isCreate): string
+{
+    $name = $column['column_name'];
+    $id = $prefix . $name;
+    $required = $column['is_nullable'] === 'NO' && !($isCreate && $column['column_default'] !== null);
+    $req = $required ? ' required' : '';
+
+    if (isset($foreignOptions[$name])) {
+        $html = '<select id="' . h($id) . '" name="' . h($name) . '"' . $req . '><option value="">-- select --</option>';
+        foreach ($foreignOptions[$name] as $option) {
+            $html .= '<option value="' . h($option['value']) . '">' . h($option['label']) . '</option>';
+        }
+        return $html . '</select>';
+    }
+
+    if (isset($fixedOptions[$name])) {
+        $html = '<select id="' . h($id) . '" name="' . h($name) . '"' . $req . '>';
+        $html .= '<option value="">' . ($isCreate && $column['column_default'] !== null ? '(default)' : '-- select --') . '</option>';
+        foreach ($fixedOptions[$name] as $option) {
+            $html .= '<option value="' . h($option) . '">' . h($option) . '</option>';
+        }
+        return $html . '</select>';
+    }
+
+    $type = 'text';
+    $extra = '';
+    if ($column['data_type'] === 'date') {
+        $type = 'date';
+    } elseif (in_array($column['data_type'], ['integer', 'smallint', 'bigint'], true)) {
+        $type = 'number';
+        $extra = ' step="1"';
+    }
+
+    return '<input id="' . h($id) . '" type="' . $type . '" name="' . h($name) . '"' . $extra . $req . '>';
+}
+
+renderHeader('Manage Records', 'crud');
 ?>
+    <h1>Manage Records</h1>
+    <p class="subtitle">Create, view, update and delete records in the PostgreSQL database.</p>
 
-<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Database CRUD Demo</title>
-    <style>
-        :root {
-            --border: #e2e2e2;
-            --text: #2b2b2b;
-            --muted: #6b6b6b;
-            --accent: #2f6f4f;
-            --danger: #a33;
-            --bg-soft: #fafafa;
-        }
+    <?php renderFlash(); ?>
 
-        * { box-sizing: border-box; }
-
-        body {
-            font-family: Arial, sans-serif;
-            color: var(--text);
-            max-width: 1100px;
-            margin: 40px auto;
-            padding: 0 20px;
-            line-height: 1.5;
-        }
-
-        h1, h2, h3 { margin-bottom: 12px; }
-        p.subtitle { color: var(--muted); margin-top: 0; margin-bottom: 28px; }
-
-        .table-tabs {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            margin-bottom: 24px;
-        }
-
-        .table-tabs a {
-            text-decoration: none;
-            background: var(--bg-soft);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 8px 12px;
-            color: var(--text);
-        }
-
-        .table-tabs a.active {
-            background: var(--accent);
-            border-color: var(--accent);
-            color: #fff;
-        }
-
-        section {
-            margin-bottom: 40px;
-            padding: 20px;
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            background: #fff;
-        }
-
-        .field {
-            margin-bottom: 12px;
-        }
-
-        label {
-            display: block;
-            font-size: 13px;
-            color: var(--muted);
-            margin-bottom: 4px;
-        }
-
-        input, textarea, select {
-            width: 100%;
-            padding: 8px 10px;
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            font-size: 14px;
-            color: var(--text);
-        }
-
-        input:focus { outline: none; border-color: var(--accent); }
-        input[readonly] {
-            background: #eee;
-            color: var(--muted);
-            cursor: not-allowed;
-        }
-
-        button {
-            padding: 8px 16px;
-            border-radius: 6px;
-            border: 1px solid var(--accent);
-            background: var(--accent);
-            color: #fff;
-            font-size: 14px;
-            cursor: pointer;
-        }
-
-        button.secondary {
-            background: transparent;
-            color: var(--text);
-            border-color: var(--border);
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 14px;
-        }
-
-        th, td {
-            text-align: left;
-            padding: 10px;
-            border-bottom: 1px solid var(--border);
-            vertical-align: top;
-        }
-
-        th {
-            font-size: 12px;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-            color: var(--muted);
-        }
-
-        tr:hover td { background: var(--bg-soft); }
-
-        .row-actions { white-space: nowrap; }
-        .row-actions form { display: inline; }
-        .row-actions .row-edit {
-            background: transparent;
-            color: var(--text);
-            border-color: var(--border);
-        }
-        .row-actions .row-delete {
-            background: none;
-            border: none;
-            color: var(--danger);
-            padding: 4px 6px;
-            font-size: 13px;
-        }
-
-        .empty {
-            color: var(--muted);
-            padding: 16px 0;
-        }
-    </style>
-</head>
-<body>
-    <h1>Database CRUD Demo</h1>
-    <p class="subtitle">Manage records across the selected table in the project database.</p>
-
-    <nav class="table-tabs" aria-label="Database tables">
+    <nav class="tabs" aria-label="Database tables">
         <?php foreach ($allowedTables as $tableName): ?>
-            <a href="?table=<?= urlencode($tableName) ?>" class="<?= $tableName === $currentTable ? 'active' : '' ?>"><?= htmlspecialchars(ucfirst($tableName), ENT_QUOTES, 'UTF-8') ?></a>
+            <a href="?table=<?= h(urlencode($tableName)) ?>" class="<?= $tableName === $currentTable ? 'active' : '' ?>"><?= h($tableLabels[$tableName] ?? labelFor($tableName)) ?></a>
         <?php endforeach; ?>
     </nav>
 
-    <?php $selectedMeta = $tableMeta[$currentTable] ?? ['primaryKey' => null, 'columns' => [], 'readRows' => []]; ?>
-    <?php $selectedPrimaryKey = $selectedMeta['primaryKey']; ?>
-    <?php $editableColumns = array_values(array_filter($selectedMeta['columns'], function ($column) use ($selectedPrimaryKey) {
-        return ($column['column_name'] ?? '') !== $selectedPrimaryKey;
-    })); ?>
-
     <section>
-        <h2>Add <?= htmlspecialchars(formatLabel($currentTable, 'Table'), ENT_QUOTES, 'UTF-8') ?></h2>
+        <h2>Add <?= h($tableLabels[$currentTable] ?? labelFor($currentTable)) ?></h2>
         <form method="post">
             <input type="hidden" name="action" value="create">
-            <input type="hidden" name="table" value="<?= htmlspecialchars($currentTable, ENT_QUOTES, 'UTF-8') ?>">
-
-            <?php foreach ($editableColumns as $column): ?>
-                <?php $columnName = $column['column_name']; ?>
-                <div class="field">
-                    <label for="create_<?= htmlspecialchars($columnName, ENT_QUOTES, 'UTF-8') ?>"><?= htmlspecialchars(formatLabel($columnName, 'Field'), ENT_QUOTES, 'UTF-8') ?></label>
-                    <input id="create_<?= htmlspecialchars($columnName, ENT_QUOTES, 'UTF-8') ?>" type="text" name="<?= htmlspecialchars($columnName, ENT_QUOTES, 'UTF-8') ?>">
-                </div>
-            <?php endforeach; ?>
-
+            <input type="hidden" name="table" value="<?= h($currentTable) ?>">
+            <div class="grid-2">
+                <?php foreach ($editableColumns as $column): ?>
+                    <div class="field">
+                        <label for="create_<?= h($column['column_name']) ?>"><?= h(labelFor($column['column_name'])) ?></label>
+                        <?= renderControl($column, $foreignOptions, $fixedOptions, 'create_', true) ?>
+                    </div>
+                <?php endforeach; ?>
+            </div>
             <button type="submit">Add Record</button>
         </form>
     </section>
 
     <section>
         <h2>Records</h2>
-        <?php if (empty($selectedMeta['readRows'])): ?>
-            <p class="empty">No records found for <?= htmlspecialchars($currentTable, ENT_QUOTES, 'UTF-8') ?>.</p>
+        <?php if (empty($rows)): ?>
+            <p class="empty">No records found.</p>
         <?php else: ?>
         <table>
             <thead>
                 <tr>
-                    <?php foreach ($selectedMeta['columns'] as $column): ?>
-                        <th><?= htmlspecialchars(formatLabel($column['column_name'] ?? null, 'Field'), ENT_QUOTES, 'UTF-8') ?></th>
+                    <?php foreach ($columns as $column): ?>
+                        <th><?= h(labelFor($column['column_name'])) ?></th>
                     <?php endforeach; ?>
                     <th></th>
                 </tr>
             </thead>
             <tbody>
-                <?php foreach ($selectedMeta['readRows'] as $row): ?>
+                <?php foreach ($rows as $row): ?>
                     <tr>
-                        <?php foreach ($selectedMeta['columns'] as $column): ?>
-                            <?php $key = $column['column_name']; ?>
-                            <td><?= htmlspecialchars((string) ($row[$key] ?? ''), ENT_QUOTES, 'UTF-8') ?></td>
+                        <?php foreach ($columns as $column): ?>
+                            <?php
+                                $cell = $row[$column['column_name']] ?? '';
+                                $cellKey = $column['column_name'];
+                                if (isset($foreignLabels[$cellKey][(string) $cell])) {
+                                    $cell = $foreignLabels[$cellKey][(string) $cell];
+                                }
+                            ?>
+                            <td><?= h($cell) ?></td>
                         <?php endforeach; ?>
                         <td class="row-actions">
-                            <button
-                                type="button"
-                                class="row-edit"
-                                data-row="<?= htmlspecialchars(json_encode($row, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT), ENT_QUOTES, 'UTF-8') ?>"
-                            >Edit</button>
-                            <form method="post">
+                            <button type="button" class="secondary row-edit"
+                                data-row="<?= h(json_encode($row, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT)) ?>">Edit</button>
+                            <form method="post" onsubmit="return confirm('Delete this record?');">
                                 <input type="hidden" name="action" value="delete">
-                                <input type="hidden" name="table" value="<?= htmlspecialchars($currentTable, ENT_QUOTES, 'UTF-8') ?>">
-                                <input type="hidden" name="<?= htmlspecialchars($selectedPrimaryKey, ENT_QUOTES, 'UTF-8') ?>" value="<?= (int) ($row[$selectedPrimaryKey] ?? 0) ?>">
-                                <button type="submit" class="row-delete">Delete</button>
+                                <input type="hidden" name="table" value="<?= h($currentTable) ?>">
+                                <input type="hidden" name="<?= h($primaryKey) ?>" value="<?= (int) $row[$primaryKey] ?>">
+                                <button type="submit" class="link-danger">Delete</button>
                             </form>
                         </td>
                     </tr>
@@ -443,29 +449,32 @@ if (
     </section>
 
     <section>
-        <h2>Update <?= htmlspecialchars(formatLabel($currentTable, 'Table'), ENT_QUOTES, 'UTF-8') ?></h2>
+        <h2>Update <?= h($tableLabels[$currentTable] ?? labelFor($currentTable)) ?></h2>
+        <p class="note">Click <strong>Edit</strong> on a row above to load it here.</p>
         <form method="post" id="update-form">
             <input type="hidden" name="action" value="update">
-            <input type="hidden" name="table" value="<?= htmlspecialchars($currentTable, ENT_QUOTES, 'UTF-8') ?>">
+            <input type="hidden" name="table" value="<?= h($currentTable) ?>">
 
-            <?php if ($selectedPrimaryKey): ?>
+            <?php if ($primaryKey): ?>
                 <div class="field">
-                    <label for="update_pk"><?= htmlspecialchars(formatLabel($selectedPrimaryKey, 'Id'), ENT_QUOTES, 'UTF-8') ?></label>
-                    <input id="update_pk" type="number" name="<?= htmlspecialchars($selectedPrimaryKey, ENT_QUOTES, 'UTF-8') ?>" readonly required>
+                    <label for="update_pk"><?= h(labelFor($primaryKey)) ?></label>
+                    <input id="update_pk" type="number" name="<?= h($primaryKey) ?>" readonly required>
                 </div>
             <?php endif; ?>
 
-            <?php foreach ($editableColumns as $column): ?>
-                <?php $columnName = $column['column_name']; ?>
-                <div class="field">
-                    <label for="update_<?= htmlspecialchars($columnName, ENT_QUOTES, 'UTF-8') ?>"><?= htmlspecialchars(formatLabel($columnName, 'Field'), ENT_QUOTES, 'UTF-8') ?></label>
-                    <input id="update_<?= htmlspecialchars($columnName, ENT_QUOTES, 'UTF-8') ?>" type="text" name="<?= htmlspecialchars($columnName, ENT_QUOTES, 'UTF-8') ?>" data-update-field required>
-                </div>
-            <?php endforeach; ?>
+            <div class="grid-2">
+                <?php foreach ($editableColumns as $column): ?>
+                    <div class="field">
+                        <label for="update_<?= h($column['column_name']) ?>"><?= h(labelFor($column['column_name'])) ?></label>
+                        <?= renderControl($column, $foreignOptions, $fixedOptions, 'update_', false) ?>
+                    </div>
+                <?php endforeach; ?>
+            </div>
 
             <button type="submit" class="secondary">Update Record</button>
         </form>
     </section>
+
     <script>
         const updateForm = document.getElementById('update-form');
 
@@ -479,9 +488,7 @@ if (
                 });
 
                 updateForm.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                updateForm.querySelector('[data-update-field]')?.focus();
             });
         });
     </script>
-</body>
-</html>
+<?php renderFooter($pdo);

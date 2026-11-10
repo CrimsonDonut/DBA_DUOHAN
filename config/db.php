@@ -3,9 +3,9 @@
 function getPdo(): PDO
 {
     $config = [
-        'host' => getenv('DB_HOST') ?: '192.168.1.35',
+        'host' => getenv('DB_HOST') ?: '10.14.121.53',
         'port' => getenv('DB_PORT') ?: '5432',
-        'dbname' => getenv('DB_NAME') ?: 'FinalLabChallengeWk4',
+        'dbname' => getenv('DB_NAME') ?: 'Duo_Ton',
         'user' => getenv('DB_USER') ?: 'postgres',
         'password' => getenv('DB_PASSWORD') ?: 'ton0127',
     ];
