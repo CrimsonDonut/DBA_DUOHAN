@@ -3,11 +3,11 @@
 function getPdo(): PDO
 {
     $config = [
-        'host' => getenv('DB_HOST') ?: '10.14.121.53',
+        'host' => getenv('DB_HOST') ?: '10.14.121.53', // IP ni Ryan
         'port' => getenv('DB_PORT') ?: '5432',
-        'dbname' => getenv('DB_NAME') ?: 'Duo_Ton',
+        'dbname' => getenv('DB_NAME') ?: 'Duo_Ton', // 
         'user' => getenv('DB_USER') ?: 'postgres',
-        'password' => getenv('DB_PASSWORD') ?: 'PostGreSQL123',
+        'password' => getenv('DB_PASSWORD') ?: '1234', // Password ni Ryan: 1234
     ];
 
     $dsn = sprintf(
