@@ -377,7 +377,7 @@ function renderControl(array $column, array $foreignOptions, array $fixedOptions
 renderHeader('Manage Records', 'crud');
 ?>
     <h1>Manage Records</h1>
-    <p class="subtitle">Create, view, update and delete records in the PostgreSQL database.</p>
+    <p class="subtitle">Manage gear, borrowers, borrowing transactions and the items on each one.</p>
 
     <?php renderFlash(); ?>
 
@@ -409,7 +409,7 @@ renderHeader('Manage Records', 'crud');
         <?php if (empty($rows)): ?>
             <p class="empty">No records found.</p>
         <?php else: ?>
-        <table>
+        <div class="table-wrap"><table>
             <thead>
                 <tr>
                     <?php foreach ($columns as $column): ?>
@@ -429,7 +429,7 @@ renderHeader('Manage Records', 'crud');
                                     $cell = $foreignLabels[$cellKey][(string) $cell];
                                 }
                             ?>
-                            <td><?= h($cell) ?></td>
+                            <td><?= renderCell($column['column_name'], $cell) ?></td>
                         <?php endforeach; ?>
                         <td class="row-actions">
                             <button type="button" class="secondary row-edit"
@@ -444,7 +444,7 @@ renderHeader('Manage Records', 'crud');
                     </tr>
                 <?php endforeach; ?>
             </tbody>
-        </table>
+        </table></div>
         <?php endif; ?>
     </section>
 

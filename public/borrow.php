@@ -140,6 +140,28 @@ $recent = $pdo->query(
      LIMIT 10"
 )->fetchAll(PDO::FETCH_ASSOC);
 
+$stats = $pdo->query(
+    "SELECT
+        (SELECT COUNT(*) FROM borrow_transactions WHERE status IN ('Active', 'Overdue')) AS open_loans,
+        (SELECT COUNT(*) FROM borrow_transactions
+          WHERE status = 'Overdue' OR (status = 'Active' AND due_date < CURRENT_DATE)) AS overdue_loans,
+        (SELECT COALESCE(SUM(i.quantity), 0)
+           FROM borrow_items AS i
+           JOIN borrow_transactions AS t ON t.borrow_id = i.borrow_id
+          WHERE t.status IN ('Active', 'Overdue')) AS units_out,
+        (SELECT COUNT(*) FROM equipment WHERE quantity_available <= 3) AS low_stock_items"
+)->fetch(PDO::FETCH_ASSOC);
+
+$gear = $pdo->query(
+    "SELECT e.equipment_id, e.property_no, e.equipment_name, e.quantity_available,
+            COALESCE(SUM(i.quantity) FILTER (WHERE t.status IN ('Active', 'Overdue')), 0)::int AS out_qty
+     FROM equipment AS e
+     LEFT JOIN borrow_items AS i ON i.equipment_id = e.equipment_id
+     LEFT JOIN borrow_transactions AS t ON t.borrow_id = i.borrow_id
+     GROUP BY e.equipment_id, e.property_no, e.equipment_name, e.quantity_available
+     ORDER BY e.equipment_name"
+)->fetchAll(PDO::FETCH_ASSOC);
+
 $selectedBorrower = $_POST['borrower_id'] ?? '';
 $borrowDateValue = $_POST['borrow_date'] ?? date('Y-m-d');
 $dueDateValue = $_POST['due_date'] ?? date('Y-m-d', strtotime('+7 days'));
@@ -159,9 +181,32 @@ function equipmentOptions(array $equipment, string $selected): string
 renderHeader('New Borrowing', 'borrow');
 ?>
     <h1>New Borrowing</h1>
-    <p class="subtitle">Record one borrowing transaction with one or more equipment items. The header and all items are saved together or not at all.</p>
+    <p class="subtitle">Check out gym gear to a borrower. The transaction and every item on it are saved together, or not at all.</p>
 
     <?php renderFlash($errors); ?>
+
+    <div class="stats">
+        <div class="stat">
+            <div class="stat-label">Open loans</div>
+            <div class="stat-value"><?= h($stats['open_loans']) ?></div>
+            <div class="stat-hint">Active or overdue</div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">Units out</div>
+            <div class="stat-value"><?= h($stats['units_out']) ?></div>
+            <div class="stat-hint">Pieces currently borrowed</div>
+        </div>
+        <div class="stat <?= (int) $stats['overdue_loans'] > 0 ? 'alert' : '' ?>">
+            <div class="stat-label">Overdue</div>
+            <div class="stat-value"><?= h($stats['overdue_loans']) ?></div>
+            <div class="stat-hint">Past the due date</div>
+        </div>
+        <div class="stat <?= (int) $stats['low_stock_items'] > 0 ? 'warn' : '' ?>">
+            <div class="stat-label">Low stock</div>
+            <div class="stat-value"><?= h($stats['low_stock_items']) ?></div>
+            <div class="stat-hint">Items with 3 or fewer left</div>
+        </div>
+    </div>
 
     <section>
         <h2>Borrowing form</h2>
@@ -219,11 +264,38 @@ renderHeader('New Borrowing', 'borrow');
     </section>
 
     <section>
+        <h2>Gear availability</h2>
+        <?php if (empty($gear)): ?>
+            <p class="empty">No equipment registered yet.</p>
+        <?php else: ?>
+        <div class="gear-grid">
+            <?php foreach ($gear as $item): ?>
+                <?php
+                    $left = (int) $item['quantity_available'];
+                    $level = $left === 0 ? 'Out of Stock' : ($left <= 3 ? 'Low Stock' : 'Available');
+                ?>
+                <div class="gear">
+                    <div>
+                        <div class="gear-name"><?= h($item['equipment_name']) ?></div>
+                        <div class="gear-code"><?= h($item['property_no']) ?></div>
+                    </div>
+                    <div class="gear-count"><?= $left ?><small>available</small></div>
+                    <div class="gear-foot">
+                        <span><?= (int) $item['out_qty'] ?> out on loan</span>
+                        <?= badge($level) ?>
+                    </div>
+                </div>
+            <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
+    </section>
+
+    <section>
         <h2>Latest transactions</h2>
         <?php if (empty($recent)): ?>
             <p class="empty">No transactions yet.</p>
         <?php else: ?>
-        <table>
+        <div class="table-wrap"><table>
             <thead>
                 <tr><th>ID</th><th>Borrower</th><th>Items</th><th>Borrowed</th><th>Due</th><th>Status</th></tr>
             </thead>
@@ -235,11 +307,11 @@ renderHeader('New Borrowing', 'borrow');
                         <td><?= h($row['items'] ?? '(no items)') ?></td>
                         <td><?= h($row['borrow_date']) ?></td>
                         <td><?= h($row['due_date']) ?></td>
-                        <td><?= h($row['status']) ?></td>
+                        <td><?= badge((string) $row['status']) ?></td>
                     </tr>
                 <?php endforeach; ?>
             </tbody>
-        </table>
+        </table></div>
         <?php endif; ?>
     </section>
 

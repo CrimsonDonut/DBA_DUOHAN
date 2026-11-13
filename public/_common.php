@@ -85,6 +85,49 @@ function isValidDate(string $value): bool
     return $date !== false && $date->format('Y-m-d') === $value;
 }
 
+/** Colour class for a status-like value, or null when it should stay plain text. */
+function badgeClass(string $value): ?string
+{
+    static $map = [
+        // good
+        'returned' => 'good', 'available' => 'good', 'in stock' => 'good', 'clear' => 'good',
+        'yes' => 'good', 'insert' => 'good',
+        // in progress
+        'active' => 'info', 'on loan' => 'info', 'has active loan' => 'info',
+        // attention
+        'due soon' => 'warn', 'low stock' => 'warn', 'update' => 'warn',
+        // problem
+        'overdue' => 'bad', 'out of stock' => 'bad', 'has overdue' => 'bad', 'no' => 'bad', 'delete' => 'bad',
+        // inactive
+        'cancelled' => 'neutral', 'no activity' => 'neutral',
+    ];
+
+    return $map[strtolower(trim($value))] ?? null;
+}
+
+function badge(string $value): string
+{
+    $class = badgeClass($value);
+    if ($class === null) {
+        return h($value);
+    }
+    return '<span class="badge badge-' . $class . '">' . h($value) . '</span>';
+}
+
+/** Table cell content: status-like columns become coloured badges. */
+function renderCell(string $column, $value): string
+{
+    static $badgeColumns = [
+        'status', 'loan_class', 'availability_class', 'standing', 'operation',
+        'stock_level', 'can_borrow_3', 'can_borrow_10',
+    ];
+
+    if (in_array($column, $badgeColumns, true) && $value !== null && $value !== '') {
+        return badge((string) $value);
+    }
+    return h($value);
+}
+
 function renderHeader(string $title, string $active): void
 {
     $links = [
@@ -98,20 +141,39 @@ function renderHeader(string $title, string $active): void
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title><?= h($title) ?></title>
+    <meta name="theme-color" content="#121212">
+    <title><?= h($title) ?> &middot; TonFit</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <nav class="main-nav" aria-label="Main navigation">
-        <?php foreach ($links as $key => [$href, $label]): ?>
-            <a href="<?= h($href) ?>" class="<?= $key === $active ? 'active' : '' ?>"><?= h($label) ?></a>
-        <?php endforeach; ?>
-    </nav>
+    <header class="app-bar">
+        <div class="app-bar-inner">
+            <a class="brand" href="borrow.php" aria-label="TonFit">
+                <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+                    <rect x="0.5" y="11" width="4" height="10" rx="1.5" fill="currentColor"/>
+                    <rect x="5.5" y="6.5" width="4.5" height="19" rx="1.5" fill="currentColor"/>
+                    <rect x="10" y="14.5" width="12" height="3" rx="1.5" fill="currentColor" opacity="0.55"/>
+                    <rect x="22" y="6.5" width="4.5" height="19" rx="1.5" fill="currentColor"/>
+                    <rect x="27.5" y="11" width="4" height="10" rx="1.5" fill="currentColor"/>
+                </svg>
+                <span class="brand-name">Ton<span>Fit</span></span>
+                <span class="brand-tag">Equipment<br>lending</span>
+            </a>
+            <nav class="main-nav" aria-label="Main navigation">
+                <?php foreach ($links as $key => [$href, $label]): ?>
+                    <a href="<?= h($href) ?>" class="<?= $key === $active ? 'active' : '' ?>"><?= h($label) ?></a>
+                <?php endforeach; ?>
+            </nav>
+        </div>
+    </header>
+    <main class="page">
 <?php
 }
 
 function renderFooter(?PDO $pdo = null): void
 {
+    echo "    </main>\n    <footer class=\"app-footer\">\n";
+
     if ($pdo !== null) {
         try {
             $info = $pdo->query(
@@ -119,11 +181,13 @@ function renderFooter(?PDO $pdo = null): void
                         COALESCE(host(inet_server_addr()), 'local socket') AS server_ip,
                         COALESCE(inet_server_port()::text, '-') AS server_port"
             )->fetch(PDO::FETCH_ASSOC);
-            echo '<p class="conn-info">Connected to PostgreSQL server <strong>' . h($info['server_ip'])
-                . ':' . h($info['server_port']) . '</strong>, database <strong>' . h($info['db']) . '</strong></p>';
+            echo '        <p class="conn-info"><span class="dot"></span>Connected to PostgreSQL server <strong>'
+                . h($info['server_ip']) . ':' . h($info['server_port'])
+                . '</strong> &middot; database <strong>' . h($info['db']) . '</strong></p>' . "\n";
         } catch (PDOException $e) {
             error_log('Connection info failed: ' . $e->getMessage());
         }
     }
-    echo "</body>\n</html>\n";
+
+    echo "        <span>TonFit &middot; Gym equipment lending</span>\n    </footer>\n</body>\n</html>\n";
 }

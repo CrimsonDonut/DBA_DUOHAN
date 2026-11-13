@@ -457,7 +457,7 @@ renderHeader('Reports', 'reports');
                 <?php if (empty($rows)): ?>
                     <p class="empty">No rows to show.</p>
                 <?php else: ?>
-                    <table>
+                    <div class="table-wrap"><table>
                         <thead>
                             <tr>
                                 <?php foreach (array_keys($rows[0]) as $column): ?>
@@ -468,13 +468,13 @@ renderHeader('Reports', 'reports');
                         <tbody>
                             <?php foreach ($rows as $row): ?>
                                 <tr>
-                                    <?php foreach ($row as $value): ?>
-                                        <td><?= h($value) ?></td>
+                                    <?php foreach ($row as $column => $value): ?>
+                                        <td><?= renderCell((string) $column, $value) ?></td>
                                     <?php endforeach; ?>
                                 </tr>
                             <?php endforeach; ?>
                         </tbody>
-                    </table>
+                    </table></div>
                     <p class="note"><?= count($rows) ?> row(s)</p>
                 <?php endif; ?>
             </section>
